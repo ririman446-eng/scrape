@@ -190,23 +190,57 @@ class Fetcher:
         except ImportError:
             log.error(
                 "Playwright not installed. Run: pip install playwright && "
-                "playwright install chromium"
+                "python -m playwright install chromium"
             )
             return None
 
         log.info("Using Playwright for %s", url)
         try:
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-infobars",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
                 ctx = browser.new_context(
                     user_agent=HEADERS["User-Agent"],
                     locale="en-US",
-                    viewport={"width": 1280, "height": 800},
+                    timezone_id="Europe/London",
+                    viewport={"width": 1280, "height": 900},
+                    extra_http_headers={
+                        "Accept": HEADERS["Accept"],
+                        "Accept-Language": HEADERS["Accept-Language"],
+                        "Upgrade-Insecure-Requests": "1",
+                    },
+                )
+                # Hide webdriver flag
+                ctx.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
                 )
                 page = ctx.new_page()
-                page.goto(url, wait_until="networkidle", timeout=60_000)
-                html = page.content()
+
+                # Try domcontentloaded first (works on most sites)
+                html = None
+                for wait_event in ("domcontentloaded", "load"):
+                    try:
+                        page.goto(url, wait_until=wait_event, timeout=90_000)
+                        # Give JS a moment to render product data
+                        page.wait_for_timeout(2500)
+                        html = page.content()
+                        break
+                    except Exception as inner:  # noqa: BLE001
+                        log.warning("Playwright wait=%s failed: %s – retrying", wait_event, inner)
+
                 browser.close()
+
+            if not html:
+                log.error("Playwright: no HTML captured for %s", url)
+                return None
+
             time.sleep(self.delay)
             return BeautifulSoup(html, "html.parser")
         except Exception as exc:  # noqa: BLE001
