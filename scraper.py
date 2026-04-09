@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-WooCommerce product scraper for darkchemsite.com
-Outputs products, variations, and reviews in WooCommerce-compatible CSV format.
+darkchemsite.com → WooCommerce-compatible CSV scraper
+Site is a Next.js app (not WordPress). Scraper uses Playwright to render
+pages, extracts __NEXT_DATA__ JSON where available, and falls back to
+parsing visible page text.
 
 Usage:
     python scraper.py [--output products.csv] [--reviews reviews.csv]
-                      [--delay 1.5] [--max-pages 0] [--use-playwright]
+                      [--delay 1.5] [--headless]
 
 Requirements:
-    pip install -r requirements.txt
+    pip install playwright beautifulsoup4 requests lxml
+    python -m playwright install chromium
 """
 
 import argparse
@@ -18,15 +21,17 @@ import logging
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 
 import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.darkchemsite.com"
-PRODUCTS_URL = f"{BASE_URL}/products/"
+PRODUCTS_URL = f"{BASE_URL}/products"
+SITEMAP_URL = f"{BASE_URL}/sitemap.xml"
 
 HEADERS = {
     "User-Agent": (
@@ -36,10 +41,6 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Referer": BASE_URL + "/",
 }
 
 logging.basicConfig(
@@ -60,7 +61,7 @@ class Review:
     reviewer: str
     email: str
     date: str
-    rating: int          # 1-5
+    rating: int
     title: str
     content: str
     verified: bool
@@ -68,638 +69,594 @@ class Review:
 
 @dataclass
 class Variation:
-    """A single product variation (child of a variable product)."""
-    variation_id: int
     sku: str
+    label: str          # e.g. "10g", "50g", "100g"
     regular_price: str
     sale_price: str
-    stock_qty: str
     in_stock: bool
-    weight: str
-    length: str
-    width: str
-    height: str
-    image_url: str
-    attributes: dict     # {"pa_size": "Large", "pa_color": "Red"}
-    description: str
+    stock_qty: str
+    attributes: dict
 
 
 @dataclass
 class Product:
     url: str
-    product_id: int
     sku: str
     name: str
-    type: str            # simple | variable | grouped | external
-    status: str          # publish | draft | private
-    featured: bool
-    catalog_visibility: str   # visible | catalog | search | hidden
+    slug: str
+    category: str
     short_description: str
     description: str
     regular_price: str
     sale_price: str
-    date_sale_starts: str
-    date_sale_ends: str
-    tax_status: str      # taxable | shipping | none
-    tax_class: str
     in_stock: bool
     stock_qty: str
-    low_stock_amount: str
-    backorders: str      # no | notify | yes
-    sold_individually: bool
-    weight: str
-    length: str
-    width: str
-    height: str
-    allow_reviews: bool
-    purchase_note: str
-    categories: list     # ["Cat1", "Cat1 > Sub1"]
+    images: list
     tags: list
-    shipping_class: str
-    images: list         # list of URLs
-    download_limit: str
-    download_expiry: str
-    upsell_skus: list
-    cross_sell_skus: list
-    grouped_skus: list
-    external_url: str
-    button_text: str
-    attributes: dict     # {"Size": {"values": ["S","M","L"], "visible": True, "variation": True}}
-    meta_data: dict
+    attributes: dict
     variations: list = field(default_factory=list)
     reviews: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# Playwright browser helper
 # ---------------------------------------------------------------------------
 
-class Fetcher:
-    """Simple HTTP fetcher with retry logic, optional Playwright fallback."""
-
-    def __init__(self, delay: float = 1.5, use_playwright: bool = False):
+class Browser:
+    def __init__(self, headless: bool = False, delay: float = 1.5):
+        self.headless = headless
         self.delay = delay
-        self.use_playwright = use_playwright
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-        self._playwright = None
+        self._pw = None
+        self._browser = None
+        self._ctx = None
 
-    # -- requests-based fetch -----------------------------------------------
+    def start(self):
+        from playwright.sync_api import sync_playwright
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(
+            headless=self.headless,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        self._ctx = self._browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            locale="en-US",
+            timezone_id="Europe/Paris",
+            viewport={"width": 1280, "height": 900},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        self._ctx.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+        )
+        log.info("Browser started (headless=%s)", self.headless)
 
-    def get(self, url: str, retries: int = 4) -> Optional[BeautifulSoup]:
-        # If Playwright mode is forced, skip requests entirely
-        if self.use_playwright:
-            return self._playwright_get(url)
+    def get(self, url: str, settle_ms: int = 3000) -> tuple[str, dict]:
+        """
+        Navigate to url, wait for content, return (html, next_data_dict).
+        next_data_dict is populated from __NEXT_DATA__ script tag if present.
+        """
+        page = self._ctx.new_page()
+        try:
+            for wait in ("domcontentloaded", "load"):
+                try:
+                    page.goto(url, wait_until=wait, timeout=90_000)
+                    break
+                except Exception as e:
+                    log.warning("goto wait=%s failed: %s", wait, e)
 
-        wait = 2
-        last_exc = None
-        for attempt in range(retries):
+            page.wait_for_timeout(settle_ms)
+            html = page.content()
+
+            # Extract __NEXT_DATA__ if present
+            next_data = {}
             try:
-                log.debug("GET %s (attempt %d)", url, attempt + 1)
-                resp = self.session.get(url, timeout=30, allow_redirects=True)
-                if resp.status_code == 200:
-                    time.sleep(self.delay)
-                    return BeautifulSoup(resp.text, "html.parser")
-                if resp.status_code in (429, 503):
-                    log.warning("Rate limited (%s). Waiting %ds…", resp.status_code, wait)
-                    time.sleep(wait)
-                    wait *= 2
-                    continue
-                if resp.status_code == 403:
-                    log.warning("403 on %s – trying Playwright fallback", url)
-                    return self._playwright_get(url)
-                log.error("HTTP %s for %s", resp.status_code, url)
-                return None
-            except requests.exceptions.ProxyError as exc:
-                # Hard proxy block – no point retrying with requests
-                log.warning("Proxy error for %s – switching to Playwright: %s", url, exc)
-                return self._playwright_get(url)
-            except requests.RequestException as exc:
-                last_exc = exc
-                log.warning("Request error (%s), retry in %ds", exc, wait)
-                time.sleep(wait)
-                wait *= 2
-        log.error("All retries exhausted for %s (last error: %s)", url, last_exc)
-        return None
-
-    # -- Playwright fallback ------------------------------------------------
-
-    def _playwright_get(self, url: str) -> Optional[BeautifulSoup]:
-        try:
-            from playwright.sync_api import sync_playwright  # noqa: PLC0415
-        except ImportError:
-            log.error(
-                "Playwright not installed. Run: pip install playwright && "
-                "python -m playwright install chromium"
-            )
-            return None
-
-        log.info("Using Playwright for %s", url)
-        try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-blink-features=AutomationControlled",
-                        "--disable-infobars",
-                        "--disable-dev-shm-usage",
-                    ],
+                nd_content = page.eval_on_selector(
+                    "#__NEXT_DATA__", "el => el.textContent"
                 )
-                ctx = browser.new_context(
-                    user_agent=HEADERS["User-Agent"],
-                    locale="en-US",
-                    timezone_id="Europe/London",
-                    viewport={"width": 1280, "height": 900},
-                    extra_http_headers={
-                        "Accept": HEADERS["Accept"],
-                        "Accept-Language": HEADERS["Accept-Language"],
-                        "Upgrade-Insecure-Requests": "1",
-                    },
-                )
-                # Hide webdriver flag
-                ctx.add_init_script(
-                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-                )
-                page = ctx.new_page()
+                next_data = json.loads(nd_content)
+            except Exception:
+                pass
 
-                # Try domcontentloaded first (works on most sites)
-                html = None
-                for wait_event in ("domcontentloaded", "load"):
-                    try:
-                        page.goto(url, wait_until=wait_event, timeout=90_000)
-                        # Give JS a moment to render product data
-                        page.wait_for_timeout(2500)
-                        html = page.content()
-                        break
-                    except Exception as inner:  # noqa: BLE001
-                        log.warning("Playwright wait=%s failed: %s – retrying", wait_event, inner)
-
-                browser.close()
-
-            if not html:
-                log.error("Playwright: no HTML captured for %s", url)
-                return None
+            # Also try to intercept RSC / window data
+            if not next_data:
+                try:
+                    rsc = page.evaluate("() => window.__NEXT_DATA__")
+                    if rsc:
+                        next_data = rsc
+                except Exception:
+                    pass
 
             time.sleep(self.delay)
-            return BeautifulSoup(html, "html.parser")
-        except Exception as exc:  # noqa: BLE001
-            log.error("Playwright failed for %s: %s", url, exc)
-            return None
+            return html, next_data
+        finally:
+            page.close()
 
     def close(self):
-        self.session.close()
+        if self._browser:
+            self._browser.close()
+        if self._pw:
+            self._pw.stop()
 
 
 # ---------------------------------------------------------------------------
-# Parsing helpers
+# Step 1: collect product URLs
 # ---------------------------------------------------------------------------
 
-def _text(el) -> str:
-    return el.get_text(separator=" ", strip=True) if el else ""
+def get_product_urls_from_sitemap() -> list[str]:
+    """Try to get product URLs from sitemap.xml."""
+    try:
+        resp = requests.get(SITEMAP_URL, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return []
+        # Parse XML, collect /products/{slug} URLs
+        root = ET.fromstring(resp.text)
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        urls = []
+        for loc in root.findall(".//sm:loc", ns):
+            u = (loc.text or "").strip()
+            # Match /products/something (not just /products)
+            if re.search(r"/products/[^/\s?]+$", u):
+                if not u.startswith("https://www."):
+                    u = u.replace("https://", "https://www.")
+                urls.append(u)
+        log.info("Sitemap gave %d product URLs", len(urls))
+        return urls
+    except Exception as e:
+        log.warning("Sitemap fetch failed: %s", e)
+        return []
+
+
+def get_product_urls_from_listing(browser: Browser) -> list[str]:
+    """Scrape product URLs from the /products listing page."""
+    log.info("Loading product listing: %s", PRODUCTS_URL)
+    html, _ = browser.get(PRODUCTS_URL, settle_ms=4000)
+    soup = BeautifulSoup(html, "html.parser")
+
+    urls = []
+    seen = set()
+    # Find all links matching /products/{slug}
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        # Normalise relative to absolute
+        if href.startswith("/"):
+            href = BASE_URL + href
+        if re.search(r"/products/[^/\s?#]+$", href):
+            clean = href.split("?")[0].split("#")[0]
+            if clean not in seen and clean != PRODUCTS_URL:
+                seen.add(clean)
+                urls.append(clean)
+
+    log.info("Listing page gave %d product URLs", len(urls))
+    return urls
+
+
+def collect_product_urls(browser: Browser) -> list[str]:
+    # Try sitemap first (fast, no JS needed)
+    urls = get_product_urls_from_sitemap()
+    if not urls:
+        urls = get_product_urls_from_listing(browser)
+    return list(dict.fromkeys(urls))  # deduplicate
+
+
+# ---------------------------------------------------------------------------
+# Step 2: parse individual product pages
+# ---------------------------------------------------------------------------
+
+def _slug_to_sku(slug: str) -> str:
+    return slug.upper().replace("-", "_")
 
 
 def _clean(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def _rating_from_class(el) -> int:
-    """Extract integer rating from WooCommerce star-rating element."""
-    if not el:
-        return 0
-    for cls in el.get("class", []):
-        m = re.search(r"rating-(\d)", cls)
-        if m:
-            return int(m.group(1))
-    # fallback: count filled stars in aria label
-    aria = el.get("aria-label", "")
-    m = re.search(r"(\d)", aria)
-    return int(m.group(1)) if m else 0
+def _extract_price(text: str) -> str:
+    """Pull a numeric price string from text like '€250.00' or '$199'."""
+    m = re.search(r"[\d]+(?:[.,]\d+)?", text.replace(",", "."))
+    return m.group(0) if m else ""
 
 
-def _parse_price(soup_el) -> tuple[str, str]:
-    """Return (regular_price, sale_price) from a .price element."""
-    if not soup_el:
-        return "", ""
-    # Sale price present: <del> = regular, <ins> = sale
-    regular = soup_el.select_one("del .woocommerce-Price-amount bdi")
-    sale = soup_el.select_one("ins .woocommerce-Price-amount bdi")
-    if regular and sale:
-        return _clean(_text(regular)), _clean(_text(sale))
-    # Single price
-    single = soup_el.select_one(".woocommerce-Price-amount bdi")
-    if single:
-        return _clean(_text(single)), ""
-    return _clean(_text(soup_el)), ""
-
-
-def _absolute(url: str) -> str:
-    if url and not url.startswith("http"):
-        return urljoin(BASE_URL, url)
-    return url or ""
-
-
-# ---------------------------------------------------------------------------
-# Product list page – collect all product URLs
-# ---------------------------------------------------------------------------
-
-def collect_product_urls(fetcher: Fetcher, max_pages: int = 0) -> list[str]:
-    urls: list[str] = []
-    page = 1
-    while True:
-        page_url = PRODUCTS_URL if page == 1 else f"{PRODUCTS_URL}page/{page}/"
-        log.info("Fetching product list page %d: %s", page, page_url)
-        soup = fetcher.get(page_url)
-        if soup is None:
-            break
-
-        # WooCommerce standard: ul.products > li.product
-        products = soup.select("ul.products li.product a.woocommerce-loop-product__link")
-        if not products:
-            # Fallback: any <a> inside a li.product that leads to /product/
-            products = soup.select("li.product a[href*='/product/']")
-        if not products:
-            log.info("No products found on page %d – stopping pagination.", page)
-            break
-
-        seen = set()
-        for a in products:
-            href = _absolute(a.get("href", ""))
-            if href and href not in seen:
-                seen.add(href)
-                urls.append(href)
-        log.info("  Found %d products on page %d", len(seen), page)
-
-        # Check for next page
-        next_link = (
-            soup.select_one("a.next.page-numbers")
-            or soup.select_one(".woocommerce-pagination a.next")
-            or soup.select_one("nav.woocommerce-pagination a[rel='next']")
-        )
-        if not next_link:
-            break
-        page += 1
-        if max_pages and page > max_pages:
-            log.info("Reached max_pages limit (%d).", max_pages)
-            break
-
-    log.info("Total product URLs collected: %d", len(urls))
-    return list(dict.fromkeys(urls))  # deduplicate, preserve order
-
-
-# ---------------------------------------------------------------------------
-# Single product page parser
-# ---------------------------------------------------------------------------
-
-def parse_product(soup: BeautifulSoup, url: str) -> Optional[Product]:  # noqa: PLR0912, PLR0915
-    """Parse a WooCommerce single-product page into a Product dataclass."""
-
-    # ---- Basic info -------------------------------------------------------
-    name = _clean(
-        _text(soup.select_one(".product_title"))
-        or _text(soup.select_one("h1.entry-title"))
-    )
-    if not name:
-        log.warning("Could not find product name at %s", url)
+def _parse_next_data_product(next_data: dict, slug: str) -> Optional[dict]:
+    """
+    Walk the Next.js __NEXT_DATA__ tree looking for product info.
+    Returns a flat dict of extracted fields or None.
+    """
+    if not next_data:
         return None
 
-    # product ID from body class: post-XXXX
-    product_id = 0
-    for cls in soup.body.get("class", []) if soup.body else []:
-        m = re.match(r"postid-(\d+)", cls)
-        if m:
-            product_id = int(m.group(1))
+    # Try common paths in Next.js page data
+    candidates = []
+
+    def _walk(obj, depth=0):
+        if depth > 10:
+            return
+        if isinstance(obj, dict):
+            # Check if this dict looks like a product
+            keys = set(obj.keys())
+            if any(k in keys for k in ("name", "title", "price", "description", "slug")):
+                candidates.append(obj)
+            for v in obj.values():
+                _walk(v, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item, depth + 1)
+
+    _walk(next_data)
+
+    # Find the best candidate matching our slug
+    for c in candidates:
+        c_slug = c.get("slug", c.get("id", c.get("handle", "")))
+        if str(c_slug).lower() in slug.lower() or slug.lower() in str(c_slug).lower():
+            return c
+
+    # Return the richest candidate if no slug match
+    if candidates:
+        return max(candidates, key=lambda x: len(str(x)))
+
+    return None
+
+
+def parse_product_page(html: str, next_data: dict, url: str) -> Optional[Product]:
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    soup = BeautifulSoup(html, "html.parser")
+
+    # ------------------------------------------------------------------
+    # Try to get structured data from __NEXT_DATA__ first
+    # ------------------------------------------------------------------
+    nd = _parse_next_data_product(next_data, slug)
+
+    # Also check for JSON-LD
+    jsonld = {}
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            if isinstance(data, list):
+                for d in data:
+                    if d.get("@type") in ("Product", "ItemPage"):
+                        jsonld = d
+                        break
+            elif data.get("@type") in ("Product", "ItemPage"):
+                jsonld = data
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Extract fields — priority: __NEXT_DATA__ > JSON-LD > HTML text
+    # ------------------------------------------------------------------
+
+    # Name
+    name = ""
+    if nd:
+        name = nd.get("name", nd.get("title", ""))
+    if not name:
+        name = jsonld.get("name", "")
+    if not name:
+        for sel in ("h1", ".product-title", ".product-name", "[class*='title']", "[class*='name']"):
+            el = soup.select_one(sel)
+            if el:
+                name = _clean(el.get_text())
+                if len(name) > 3:
+                    break
+    name = _clean(name) or slug.replace("-", " ").title()
+
+    # Category
+    category = ""
+    if nd:
+        cat = nd.get("category", nd.get("categories", ""))
+        if isinstance(cat, list):
+            category = cat[0] if cat else ""
+        else:
+            category = str(cat)
+    if not category:
+        # Try breadcrumb
+        for sel in (".breadcrumb a", "nav[aria-label*='breadcrumb'] a", "[class*='breadcrumb'] a"):
+            crumbs = soup.select(sel)
+            if len(crumbs) >= 2:
+                category = _clean(crumbs[-1].get_text())
+                break
+    category = _clean(category)
+
+    # Description
+    description = ""
+    short_description = ""
+    if nd:
+        description = nd.get("description", nd.get("details", nd.get("longDescription", "")))
+        short_description = nd.get("shortDescription", nd.get("summary", ""))
+    if not description:
+        description = jsonld.get("description", "")
+    if not description:
+        for sel in (
+            "[class*='description']", "[class*='detail']",
+            "[class*='about']", "article", "main p",
+        ):
+            els = soup.select(sel)
+            if els:
+                text = " ".join(_clean(e.get_text()) for e in els[:5])
+                if len(text) > 30:
+                    description = text
+                    break
+
+    # Price
+    regular_price = ""
+    sale_price = ""
+    if nd:
+        regular_price = str(nd.get("price", nd.get("regularPrice", nd.get("basePrice", ""))))
+        sale_price = str(nd.get("salePrice", nd.get("discountPrice", "")))
+        if sale_price == regular_price:
+            sale_price = ""
+    if not regular_price:
+        offers = jsonld.get("offers", {})
+        if isinstance(offers, list) and offers:
+            offers = offers[0]
+        regular_price = str(offers.get("price", ""))
+    if not regular_price:
+        # Scan page text for price pattern
+        for sel in ("[class*='price']", "[class*='cost']", "[class*='amount']"):
+            el = soup.select_one(sel)
+            if el:
+                regular_price = _extract_price(el.get_text())
+                if regular_price:
+                    break
+
+    # Stock
+    in_stock = True
+    stock_qty = ""
+    if nd:
+        stock_raw = nd.get("stock", nd.get("stockQuantity", nd.get("quantity", nd.get("inventory", ""))))
+        if stock_raw is not None:
+            try:
+                stock_qty = str(int(stock_raw))
+                in_stock = int(stock_raw) > 0
+            except (ValueError, TypeError):
+                in_stock = str(stock_raw).lower() not in ("0", "false", "out of stock", "")
+        in_stock_raw = nd.get("inStock", nd.get("available", nd.get("isAvailable", None)))
+        if in_stock_raw is not None:
+            in_stock = bool(in_stock_raw)
+    # HTML fallback for stock
+    for sel in ("[class*='stock']", "[class*='availability']", "[class*='inventory']"):
+        el = soup.select_one(sel)
+        if el:
+            t = el.get_text().lower()
+            if "out" in t or "unavailable" in t:
+                in_stock = False
+            elif "in stock" in t or "available" in t:
+                in_stock = True
+            m = re.search(r"(\d+)", t)
+            if m and not stock_qty:
+                stock_qty = m.group(1)
             break
 
-    # SKU
-    sku = _clean(_text(soup.select_one(".sku")))
-
-    # Product type from body class
-    ptype = "simple"
-    body_classes = " ".join(soup.body.get("class", [])) if soup.body else ""
-    if "product-type-variable" in body_classes:
-        ptype = "variable"
-    elif "product-type-grouped" in body_classes:
-        ptype = "grouped"
-    elif "product-type-external" in body_classes:
-        ptype = "external"
-
-    # Status / visibility
-    status = "publish"
-    catalog_visibility = "visible"
-    featured = bool(soup.select_one(".product.featured"))
-
-    # ---- Prices -----------------------------------------------------------
-    price_el = soup.select_one(".summary .price")
-    regular_price, sale_price = _parse_price(price_el)
-
-    # Sale schedule (rarely in HTML, often only in WP admin)
-    date_sale_starts = ""
-    date_sale_ends = ""
-
-    # ---- Descriptions -----------------------------------------------------
-    short_desc = ""
-    short_desc_el = soup.select_one(".woocommerce-product-details__short-description")
-    if short_desc_el:
-        short_desc = short_desc_el.decode_contents().strip()
-
-    description = ""
-    desc_el = (
-        soup.select_one("#tab-description .woocommerce-Tabs-panel")
-        or soup.select_one("#tab-description")
-        or soup.select_one(".woocommerce-product-details__description")
-        or soup.select_one(".entry-content .description")
-    )
-    if desc_el:
-        # Remove the tab title heading
-        for h in desc_el.select("h2"):
-            h.decompose()
-        description = desc_el.decode_contents().strip()
-
-    # ---- Tax --------------------------------------------------------------
-    tax_status = "taxable"
-    tax_class = ""
-
-    # ---- Stock ------------------------------------------------------------
-    in_stock = not bool(soup.select_one(".out-of-stock"))
-    stock_qty = ""
-    low_stock_amount = ""
-    backorders = "no"
-    sold_individually = False
-
-    stock_el = soup.select_one(".stock")
-    if stock_el:
-        stock_text = _text(stock_el).lower()
-        if "out of stock" in stock_text:
-            in_stock = False
-        m = re.search(r"(\d+)\s+in stock", stock_text)
-        if m:
-            stock_qty = m.group(1)
-
-    # ---- Dimensions/weight ------------------------------------------------
-    weight = ""
-    length_ = ""
-    width = ""
-    height = ""
-    for row in soup.select(".woocommerce-product-attributes tr, .shop_attributes tr"):
-        label = _text(row.select_one("th")).lower()
-        value = _text(row.select_one("td"))
-        if "weight" in label:
-            weight = value
-        elif "dimension" in label:
-            # e.g. "10 × 5 × 3 cm"
-            parts = re.split(r"[×x×]", value)
-            if len(parts) >= 3:
-                length_ = parts[0].strip()
-                width = parts[1].strip()
-                height = re.sub(r"[^\d.]", "", parts[2])
-
-    # ---- Reviews ----------------------------------------------------------
-    allow_reviews = bool(soup.select_one("#reviews") or soup.select_one("#tab-reviews"))
-
-    # ---- Purchase note ----------------------------------------------------
-    purchase_note = ""
-    note_el = soup.select_one(".woocommerce-product-details__purchase-note")
-    if note_el:
-        purchase_note = _clean(_text(note_el))
-
-    # ---- Categories & tags ------------------------------------------------
-    categories: list[str] = []
-    cat_el = soup.select_one(".posted_in")
-    if cat_el:
-        categories = [_clean(_text(a)) for a in cat_el.select("a")]
-    # Also try breadcrumbs for hierarchy
-    breadcrumb_items = soup.select(
-        ".woocommerce-breadcrumb span, "
-        "nav.woocommerce-breadcrumb a, "
-        ".breadcrumb a"
-    )
-    if breadcrumb_items and not categories:
-        # skip Home and the product name itself
-        crumbs = [_clean(_text(b)) for b in breadcrumb_items]
-        crumbs = [c for c in crumbs if c and c.lower() not in ("home", name.lower())]
-        if crumbs:
-            categories = crumbs
-
-    tags: list[str] = []
-    tag_el = soup.select_one(".tagged_as")
-    if tag_el:
-        tags = [_clean(_text(a)) for a in tag_el.select("a")]
-
-    # ---- Shipping class ---------------------------------------------------
-    shipping_class = ""
-
-    # ---- Images -----------------------------------------------------------
-    images: list[str] = []
-    for img in soup.select(
-        ".woocommerce-product-gallery__image a, "
-        ".woocommerce-product-gallery .wp-post-image"
-    ):
-        src = img.get("href") or img.get("data-large_image") or img.get("src", "")
-        src = _absolute(src)
-        if src and src not in images:
-            images.append(src)
+    # Images
+    images = []
+    if nd:
+        for key in ("images", "image", "photos", "gallery", "media"):
+            img_data = nd.get(key)
+            if img_data:
+                if isinstance(img_data, str):
+                    images.append(img_data)
+                elif isinstance(img_data, list):
+                    for item in img_data:
+                        if isinstance(item, str):
+                            images.append(item)
+                        elif isinstance(item, dict):
+                            for k in ("url", "src", "href", "path"):
+                                if item.get(k):
+                                    images.append(item[k])
+                                    break
+                break
     if not images:
-        for img in soup.select(".woocommerce-product-gallery img"):
-            src = (
-                img.get("data-large_image")
-                or img.get("data-src")
-                or img.get("src", "")
-            )
-            src = _absolute(src)
+        for img in soup.select("img[src*='upload'], img[src*='product'], img[src*='cloudinary']"):
+            src = img.get("src", "")
             if src and src not in images:
                 images.append(src)
+    # Make absolute
+    images = [
+        urljoin(BASE_URL, img) if img.startswith("/") else img
+        for img in images if img
+    ]
 
-    # ---- Attributes -------------------------------------------------------
-    attributes: dict = {}
-    for row in soup.select(".woocommerce-product-attributes tr, .shop_attributes tr"):
-        label_el = row.select_one("th")
-        value_el = row.select_one("td")
-        if not label_el or not value_el:
-            continue
-        label = _clean(_text(label_el))
-        value = _clean(_text(value_el))
-        if label.lower() in ("weight", "dimensions"):
-            continue
-        attributes[label] = {
-            "values": [v.strip() for v in value.split(",")],
-            "visible": True,
-            "variation": False,
-        }
+    # Tags
+    tags = []
+    if nd:
+        t = nd.get("tags", nd.get("keywords", []))
+        if isinstance(t, list):
+            tags = [str(x) for x in t]
+        elif isinstance(t, str):
+            tags = [x.strip() for x in t.split(",") if x.strip()]
 
-    # ---- External product -------------------------------------------------
-    external_url = ""
-    button_text = ""
-    ext_btn = soup.select_one("a.single_add_to_cart_button[href]")
-    if ptype == "external" and ext_btn:
-        external_url = _absolute(ext_btn.get("href", ""))
-        button_text = _clean(_text(ext_btn))
+    # Attributes (from Next.js data)
+    attributes = {}
+    if nd:
+        for key in ("attributes", "specs", "specifications", "properties", "details"):
+            attr_data = nd.get(key)
+            if attr_data and isinstance(attr_data, dict):
+                attributes = attr_data
+                break
+            elif attr_data and isinstance(attr_data, list):
+                for item in attr_data:
+                    if isinstance(item, dict):
+                        k = item.get("name", item.get("key", item.get("label", "")))
+                        v = item.get("value", item.get("val", ""))
+                        if k:
+                            attributes[k] = v
+                break
 
-    # ---- Upsells / cross-sells (rarely available in HTML) ----------------
-    upsell_skus: list[str] = []
-    cross_sell_skus: list[str] = []
-    grouped_skus: list[str] = []
+    # Variations
+    variations = _extract_variations(nd, soup, slug, regular_price)
 
-    # ---- Variations (JSON embedded in form) ------------------------------
-    variations: list[Variation] = []
-    var_form = soup.select_one("form.variations_form")
-    if var_form:
-        raw_json = var_form.get("data-product_variations", "[]")
-        try:
-            var_data = json.loads(raw_json)
-        except json.JSONDecodeError:
-            var_data = []
+    # Reviews
+    reviews = _extract_reviews(nd, soup, slug)
 
-        for v in var_data:
-            var_attrs = {}
-            for k, val in v.get("attributes", {}).items():
-                # Strip "attribute_" prefix that WC adds
-                attr_name = re.sub(r"^attribute_", "", k)
-                var_attrs[attr_name] = val
-
-            var_img = ""
-            if v.get("image", {}).get("url"):
-                var_img = v["image"]["url"]
-
-            dim = v.get("dimensions", {})
-            variations.append(
-                Variation(
-                    variation_id=v.get("variation_id", 0),
-                    sku=v.get("sku", ""),
-                    regular_price=str(v.get("display_regular_price", "")),
-                    sale_price=str(v.get("display_price", "")),
-                    stock_qty=str(v.get("max_qty", "")),
-                    in_stock=v.get("is_in_stock", True),
-                    weight=str(v.get("weight", "")),
-                    length=str(dim.get("length", "")),
-                    width=str(dim.get("width", "")),
-                    height=str(dim.get("height", "")),
-                    image_url=var_img,
-                    attributes=var_attrs,
-                    description=_clean(
-                        BeautifulSoup(
-                            v.get("variation_description", ""), "html.parser"
-                        ).get_text()
-                    ),
-                )
-            )
-
-        # Also mark which attributes are variation attributes
-        for sel in var_form.select("select[name^='attribute_']"):
-            attr_name = re.sub(r"^attribute_", "", sel.get("name", ""))
-            # Map to readable label via the <label> or table
-            label_el = soup.find("label", {"for": sel.get("id", "")})
-            readable = _clean(_text(label_el)) if label_el else attr_name
-            if readable not in attributes:
-                options = [
-                    o.get("value", "")
-                    for o in sel.select("option")
-                    if o.get("value")
-                ]
-                attributes[readable] = {
-                    "values": options,
-                    "visible": True,
-                    "variation": True,
-                }
-            else:
-                attributes[readable]["variation"] = True
-
-    # ---- Reviews ----------------------------------------------------------
-    reviews = _parse_reviews(soup, sku or str(product_id))
-
-    # ---- Meta data --------------------------------------------------------
-    meta_data: dict = {}
-    # Try to pick up any open-graph or schema.org meta
-    for meta in soup.select("meta[property^='og:'], meta[name^='twitter:']"):
-        key = meta.get("property") or meta.get("name", "")
-        meta_data[key] = meta.get("content", "")
+    sku = _slug_to_sku(slug)
+    if nd:
+        sku = nd.get("sku", nd.get("id", nd.get("_id", sku)))
+        sku = str(sku).upper().replace(" ", "_")
 
     return Product(
         url=url,
-        product_id=product_id,
         sku=sku,
         name=name,
-        type=ptype,
-        status=status,
-        featured=featured,
-        catalog_visibility=catalog_visibility,
-        short_description=short_desc,
-        description=description,
+        slug=slug,
+        category=category,
+        short_description=_clean(short_description),
+        description=_clean(description),
         regular_price=regular_price,
         sale_price=sale_price,
-        date_sale_starts=date_sale_starts,
-        date_sale_ends=date_sale_ends,
-        tax_status=tax_status,
-        tax_class=tax_class,
         in_stock=in_stock,
         stock_qty=stock_qty,
-        low_stock_amount=low_stock_amount,
-        backorders=backorders,
-        sold_individually=sold_individually,
-        weight=weight,
-        length=length_,
-        width=width,
-        height=height,
-        allow_reviews=allow_reviews,
-        purchase_note=purchase_note,
-        categories=categories,
-        tags=tags,
-        shipping_class=shipping_class,
         images=images,
-        download_limit="",
-        download_expiry="",
-        upsell_skus=upsell_skus,
-        cross_sell_skus=cross_sell_skus,
-        grouped_skus=grouped_skus,
-        external_url=external_url,
-        button_text=button_text,
+        tags=tags,
         attributes=attributes,
-        meta_data=meta_data,
         variations=variations,
         reviews=reviews,
     )
 
 
-def _parse_reviews(soup: BeautifulSoup, product_ref: str) -> list[Review]:
-    reviews: list[Review] = []
-    # WooCommerce review wrapper: #reviews ol.commentlist > li.review
-    for li in soup.select("#reviews ol.commentlist li.review, #tab-reviews ol.commentlist li.review"):
-        reviewer = _clean(_text(li.select_one(".comment-author strong, b.fn")))
-        email = ""  # email is never exposed in HTML
-        date_el = li.select_one("time.woocommerce-review__published-date")
-        date = date_el.get("datetime", _text(date_el)) if date_el else ""
-        rating_el = li.select_one(".star-rating")
-        rating = _rating_from_class(rating_el)
-        if rating == 0 and rating_el:
-            # Try aria-label: "Rated 4 out of 5"
-            aria = rating_el.get("aria-label", "")
-            m = re.search(r"(\d+)\s+out of", aria)
-            rating = int(m.group(1)) if m else 0
-        title = _clean(_text(li.select_one(".woocommerce-review__title, strong.review-title")))
-        content_el = li.select_one(".description p, .comment-text p")
-        content = _clean(_text(content_el))
-        verified = bool(li.select_one(".woocommerce-review__verified"))
-        reviews.append(
-            Review(
-                product_sku=product_ref,
-                reviewer=reviewer,
-                email=email,
-                date=date,
-                rating=rating,
-                title=title,
-                content=content,
-                verified=verified,
-            )
-        )
+def _extract_variations(nd: dict, soup: BeautifulSoup, slug: str, base_price: str) -> list[Variation]:
+    variations = []
+    if not nd:
+        return variations
+
+    # Look for variation arrays in next data
+    for key in ("variations", "variants", "options", "quantities", "sizes"):
+        var_list = nd.get(key)
+        if var_list and isinstance(var_list, list):
+            for i, v in enumerate(var_list):
+                if not isinstance(v, dict):
+                    continue
+                var_sku = str(v.get("sku", v.get("id", f"{slug}-var-{i+1}"))).upper()
+                label = str(v.get("label", v.get("name", v.get("option", v.get("size", v.get("weight", f"Option {i+1}"))))))
+                price = str(v.get("price", v.get("regularPrice", base_price)))
+                sale = str(v.get("salePrice", v.get("discountPrice", "")))
+                if sale == price:
+                    sale = ""
+                qty = str(v.get("stock", v.get("quantity", v.get("inventory", ""))))
+                in_stock = bool(v.get("inStock", v.get("available", True)))
+
+                # Collect all non-standard keys as attributes
+                attrs = {
+                    k: str(val)
+                    for k, val in v.items()
+                    if k not in ("sku", "id", "_id", "price", "salePrice", "regularPrice",
+                                 "discountPrice", "stock", "quantity", "inventory",
+                                 "inStock", "available", "image", "images")
+                }
+
+                variations.append(Variation(
+                    sku=var_sku,
+                    label=label,
+                    regular_price=price,
+                    sale_price=sale,
+                    in_stock=in_stock,
+                    stock_qty=qty,
+                    attributes=attrs,
+                ))
+            if variations:
+                break
+
+    # HTML fallback: look for quantity/weight selectors
+    if not variations:
+        for sel in ("select", "[role='listbox']", "[class*='option']", "[class*='variant']"):
+            opts = soup.select(f"{sel} option") or soup.select(f"{sel} [class*='option']")
+            if opts:
+                for i, opt in enumerate(opts):
+                    label = _clean(opt.get_text())
+                    val = opt.get("value", "")
+                    if label and label.lower() not in ("select", "choose", "--", ""):
+                        price = _extract_price(label) or base_price
+                        variations.append(Variation(
+                            sku=f"{_slug_to_sku(slug)}-{i+1}",
+                            label=label,
+                            regular_price=price,
+                            sale_price="",
+                            in_stock=True,
+                            stock_qty="",
+                            attributes={"Option": label},
+                        ))
+                if variations:
+                    break
+
+    return variations
+
+
+def _extract_reviews(nd: dict, soup: BeautifulSoup, product_ref: str) -> list[Review]:
+    reviews = []
+
+    # From Next.js data
+    if nd:
+        for key in ("reviews", "comments", "ratings", "testimonials"):
+            rev_list = nd.get(key)
+            if rev_list and isinstance(rev_list, list):
+                for r in rev_list:
+                    if not isinstance(r, dict):
+                        continue
+                    reviewer = str(r.get("author", r.get("name", r.get("reviewer", r.get("username", "")))))
+                    date = str(r.get("date", r.get("createdAt", r.get("timestamp", ""))))
+                    rating_raw = r.get("rating", r.get("score", r.get("stars", 0)))
+                    try:
+                        rating = int(float(str(rating_raw)))
+                    except (ValueError, TypeError):
+                        rating = 0
+                    content = _clean(str(r.get("comment", r.get("body", r.get("content", r.get("text", ""))))))
+                    title = _clean(str(r.get("title", r.get("subject", ""))))
+                    verified = bool(r.get("verified", r.get("verifiedPurchase", False)))
+                    if reviewer or content:
+                        reviews.append(Review(
+                            product_sku=product_ref,
+                            reviewer=reviewer,
+                            email="",
+                            date=date,
+                            rating=rating,
+                            title=title,
+                            content=content,
+                            verified=verified,
+                        ))
+                if reviews:
+                    break
+
+    # HTML fallback
+    if not reviews:
+        for container_sel in (
+            "[class*='review']", "[class*='comment']", "[class*='testimonial']",
+        ):
+            containers = soup.select(container_sel)
+            for el in containers:
+                text = _clean(el.get_text())
+                if len(text) < 20:
+                    continue
+                # Try to find a star rating
+                rating = 0
+                for star_el in el.select("[class*='star'], [class*='rating']"):
+                    m = re.search(r"(\d)", star_el.get_text() + " ".join(star_el.get("class", [])))
+                    if m:
+                        rating = int(m.group(1))
+                        break
+                reviews.append(Review(
+                    product_sku=product_ref,
+                    reviewer="",
+                    email="",
+                    date="",
+                    rating=rating,
+                    title="",
+                    content=text[:500],
+                    verified=False,
+                ))
+            if reviews:
+                break
+
     return reviews
 
 
 # ---------------------------------------------------------------------------
-# WooCommerce CSV export
+# WooCommerce CSV output
 # ---------------------------------------------------------------------------
 
-# Columns match WooCommerce product importer (Tools > Import)
-PRODUCT_CSV_COLUMNS = [
+PRODUCT_COLUMNS = [
     "ID", "Type", "SKU", "Name", "Published", "Is featured?",
     "Visibility in catalog", "Short description", "Description",
     "Date sale price starts", "Date sale price ends",
@@ -715,147 +672,78 @@ PRODUCT_CSV_COLUMNS = [
     "Parent", "Grouped products", "Upsells", "Cross-sells",
     "External URL", "Button text",
     "Position",
+    "Attribute 1 name", "Attribute 1 value(s)", "Attribute 1 visible", "Attribute 1 global",
+    "Attribute 2 name", "Attribute 2 value(s)", "Attribute 2 visible", "Attribute 2 global",
+    "Attribute 3 name", "Attribute 3 value(s)", "Attribute 3 visible", "Attribute 3 global",
 ]
 
-# Up to 10 attribute columns (extensible)
-MAX_ATTRIBUTES = 10
+REVIEW_COLUMNS = [
+    "comment_post_ID", "product_sku", "comment_author", "comment_author_email",
+    "comment_date", "comment_content", "comment_approved",
+    "rating", "title", "verified",
+]
 
 
-def _bool(v: bool) -> str:
+def _b(v: bool) -> str:
     return "1" if v else "0"
 
 
-def _list_to_csv_val(lst: list) -> str:
-    return ", ".join(str(x) for x in lst)
+def _product_row(p: Product, position: int, parent_sku: str = "") -> dict:
+    ptype = "variable" if p.variations else "simple"
+    if parent_sku:
+        ptype = "variation"
 
+    # Collect attribute values for variation-capable attributes
+    attr1_name, attr1_vals = "", ""
+    if p.variations:
+        # Use the label as Attribute 1
+        all_labels = list(dict.fromkeys(v.label for v in p.variations if v.label))
+        attr1_name = "Option"
+        attr1_vals = " | ".join(all_labels)
+    elif p.attributes:
+        k = next(iter(p.attributes))
+        attr1_name = k
+        v = p.attributes[k]
+        attr1_vals = v if isinstance(v, str) else " | ".join(str(x) for x in v) if isinstance(v, list) else str(v)
 
-def _build_attribute_columns(all_products: list[Product]) -> list[str]:
-    """Collect all attribute names used across all products to make stable columns."""
-    seen: dict[str, int] = {}
-    for p in all_products:
-        for name in p.attributes:
-            if name not in seen:
-                seen[name] = len(seen) + 1
-    cols = []
-    for name, idx in sorted(seen.items(), key=lambda x: x[1]):
-        if idx > MAX_ATTRIBUTES:
-            break
-        cols += [
-            f"Attribute {idx} name",
-            f"Attribute {idx} value(s)",
-            f"Attribute {idx} visible",
-            f"Attribute {idx} global",
-        ]
-    return cols
+    attr2_name, attr2_vals = "", ""
+    if len(p.attributes) > 1:
+        k = list(p.attributes.keys())[1]
+        attr2_name = k
+        v = p.attributes[k]
+        attr2_vals = v if isinstance(v, str) else " | ".join(str(x) for x in v) if isinstance(v, list) else str(v)
 
-
-def _product_to_row(
-    p: Product,
-    attr_names: list[str],
-    parent_sku: str = "",
-    position: int = 0,
-) -> dict:
-    row = {
-        "ID": str(p.product_id) if p.product_id else "",
-        "Type": p.type,
+    return {
+        "ID": "",
+        "Type": ptype,
         "SKU": p.sku,
         "Name": p.name,
-        "Published": "1" if p.status == "publish" else "0",
-        "Is featured?": _bool(p.featured),
-        "Visibility in catalog": p.catalog_visibility,
-        "Short description": p.short_description,
-        "Description": p.description,
-        "Date sale price starts": p.date_sale_starts,
-        "Date sale price ends": p.date_sale_ends,
-        "Tax status": p.tax_status,
-        "Tax class": p.tax_class,
-        "In stock?": _bool(p.in_stock),
-        "Stock": p.stock_qty,
-        "Low stock amount": p.low_stock_amount,
-        "Backorders allowed?": _bool(p.backorders == "yes"),
-        "Sold individually?": _bool(p.sold_individually),
-        "Weight (kg)": p.weight,
-        "Length (cm)": p.length,
-        "Width (cm)": p.width,
-        "Height (cm)": p.height,
-        "Allow customer reviews?": _bool(p.allow_reviews),
-        "Purchase note": p.purchase_note,
-        "Sale price": p.sale_price,
-        "Regular price": p.regular_price,
-        "Categories": _list_to_csv_val(p.categories),
-        "Tags": _list_to_csv_val(p.tags),
-        "Shipping class": p.shipping_class,
-        "Images": _list_to_csv_val(p.images),
-        "Download limit": p.download_limit,
-        "Download expiry": p.download_expiry,
-        "Parent": parent_sku,
-        "Grouped products": _list_to_csv_val(p.grouped_skus),
-        "Upsells": _list_to_csv_val(p.upsell_skus),
-        "Cross-sells": _list_to_csv_val(p.cross_sell_skus),
-        "External URL": p.external_url,
-        "Button text": p.button_text,
-        "Position": str(position),
-    }
-
-    # Attribute columns
-    idx = 1
-    for attr_name in attr_names:
-        if idx > MAX_ATTRIBUTES:
-            break
-        attr = p.attributes.get(attr_name)
-        if attr:
-            row[f"Attribute {idx} name"] = attr_name
-            row[f"Attribute {idx} value(s)"] = " | ".join(attr["values"])
-            row[f"Attribute {idx} visible"] = _bool(attr.get("visible", True))
-            row[f"Attribute {idx} global"] = "1"
-        else:
-            row[f"Attribute {idx} name"] = ""
-            row[f"Attribute {idx} value(s)"] = ""
-            row[f"Attribute {idx} visible"] = ""
-            row[f"Attribute {idx} global"] = ""
-        idx += 1
-
-    return row
-
-
-def _variation_to_row(
-    v: Variation,
-    parent_sku: str,
-    parent_name: str,
-    attr_names: list[str],
-    position: int,
-) -> dict:
-    row = {
-        "ID": str(v.variation_id) if v.variation_id else "",
-        "Type": "variation",
-        "SKU": v.sku,
-        "Name": parent_name,
         "Published": "1",
         "Is featured?": "0",
         "Visibility in catalog": "visible",
-        "Short description": v.description,
-        "Description": "",
+        "Short description": p.short_description or p.description[:200],
+        "Description": p.description,
         "Date sale price starts": "",
         "Date sale price ends": "",
         "Tax status": "taxable",
         "Tax class": "",
-        "In stock?": _bool(v.in_stock),
-        "Stock": v.stock_qty,
+        "In stock?": _b(p.in_stock),
+        "Stock": p.stock_qty,
         "Low stock amount": "",
         "Backorders allowed?": "0",
         "Sold individually?": "0",
-        "Weight (kg)": v.weight,
-        "Length (cm)": v.length,
-        "Width (cm)": v.width,
-        "Height (cm)": v.height,
-        "Allow customer reviews?": "0",
+        "Weight (kg)": "",
+        "Length (cm)": "",
+        "Width (cm)": "",
+        "Height (cm)": "",
+        "Allow customer reviews?": "1",
         "Purchase note": "",
-        "Sale price": v.sale_price,
-        "Regular price": v.regular_price,
-        "Categories": "",
-        "Tags": "",
+        "Sale price": p.sale_price,
+        "Regular price": p.regular_price,
+        "Categories": p.category,
+        "Tags": ", ".join(p.tags),
         "Shipping class": "",
-        "Images": v.image_url,
+        "Images": " | ".join(p.images),
         "Download limit": "",
         "Download expiry": "",
         "Parent": parent_sku,
@@ -865,106 +753,84 @@ def _variation_to_row(
         "External URL": "",
         "Button text": "",
         "Position": str(position),
+        "Attribute 1 name": attr1_name,
+        "Attribute 1 value(s)": attr1_vals,
+        "Attribute 1 visible": "1" if attr1_name else "",
+        "Attribute 1 global": "1" if attr1_name else "",
+        "Attribute 2 name": attr2_name,
+        "Attribute 2 value(s)": attr2_vals,
+        "Attribute 2 visible": "1" if attr2_name else "",
+        "Attribute 2 global": "1" if attr2_name else "",
+        "Attribute 3 name": "",
+        "Attribute 3 value(s)": "",
+        "Attribute 3 visible": "",
+        "Attribute 3 global": "",
     }
 
-    # Attribute columns for variation
-    idx = 1
-    for attr_name in attr_names:
-        if idx > MAX_ATTRIBUTES:
-            break
-        # Normalise: WC stores as lowercase "attribute_pa_xxx" → strip prefix
-        val = ""
-        for k, kv in v.attributes.items():
-            if k.lower().replace("pa_", "") == attr_name.lower().replace("pa_", ""):
-                val = kv
-                break
-        row[f"Attribute {idx} name"] = attr_name if val else ""
-        row[f"Attribute {idx} value(s)"] = val
-        row[f"Attribute {idx} visible"] = "1" if val else ""
-        row[f"Attribute {idx} global"] = "1" if val else ""
-        idx += 1
 
+def _variation_row(v: Variation, parent: Product, position: int) -> dict:
+    row = _product_row(parent, position, parent_sku=parent.sku)
+    row["Type"] = "variation"
+    row["SKU"] = v.sku
+    row["Regular price"] = v.regular_price
+    row["Sale price"] = v.sale_price
+    row["In stock?"] = _b(v.in_stock)
+    row["Stock"] = v.stock_qty
+    row["Short description"] = v.label
+    row["Description"] = ""
+    row["Categories"] = ""
+    row["Tags"] = ""
+    row["Images"] = ""
+    row["Attribute 1 name"] = "Option"
+    row["Attribute 1 value(s)"] = v.label
+    row["Attribute 1 visible"] = "1"
+    row["Attribute 1 global"] = "1"
+    row["Attribute 2 name"] = ""
+    row["Attribute 2 value(s)"] = ""
+    row["Attribute 2 visible"] = ""
+    row["Attribute 2 global"] = ""
     return row
 
 
-# WooCommerce reviews import CSV (via plugins like "Import Export Suite")
-REVIEW_CSV_COLUMNS = [
-    "comment_post_ID", "product_sku", "comment_author", "comment_author_email",
-    "comment_date", "comment_content", "comment_approved",
-    "rating", "title", "verified",
-]
+def write_products_csv(products: list[Product], path: str):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=PRODUCT_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        for pos, p in enumerate(products, 1):
+            w.writerow(_product_row(p, pos))
+            for vpos, v in enumerate(p.variations, 1):
+                w.writerow(_variation_row(v, p, vpos))
+    log.info("Products CSV → %s  (%d products, %d variation rows)",
+             path, len(products), sum(len(p.variations) for p in products))
 
 
-def write_products_csv(products: list[Product], filepath: str) -> None:
-    attr_names = []
-    seen: dict[str, int] = {}
-    for p in products:
-        for name in p.attributes:
-            if name not in seen:
-                seen[name] = len(seen) + 1
-    attr_names = [k for k, _ in sorted(seen.items(), key=lambda x: x[1])][:MAX_ATTRIBUTES]
-
-    attr_cols = []
-    for idx, name in enumerate(attr_names, 1):
-        attr_cols += [
-            f"Attribute {idx} name",
-            f"Attribute {idx} value(s)",
-            f"Attribute {idx} visible",
-            f"Attribute {idx} global",
-        ]
-
-    all_columns = PRODUCT_CSV_COLUMNS + attr_cols
-
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
-        writer.writeheader()
-        for pos, product in enumerate(products, 1):
-            row = _product_to_row(product, attr_names, position=pos)
-            writer.writerow(row)
-            # Write variation rows directly after the parent
-            for v_pos, var in enumerate(product.variations, 1):
-                vrow = _variation_to_row(
-                    var, product.sku or str(product.product_id),
-                    product.name, attr_names, v_pos
-                )
-                writer.writerow(vrow)
-
-    log.info("Products CSV written to %s", filepath)
-
-
-def write_reviews_csv(products: list[Product], filepath: str) -> None:
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=REVIEW_CSV_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for product in products:
-            for review in product.reviews:
-                writer.writerow({
-                    "comment_post_ID": str(product.product_id),
-                    "product_sku": review.product_sku,
-                    "comment_author": review.reviewer,
-                    "comment_author_email": review.email,
-                    "comment_date": review.date,
-                    "comment_content": review.content,
+def write_reviews_csv(products: list[Product], path: str):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=REVIEW_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        for p in products:
+            for r in p.reviews:
+                w.writerow({
+                    "comment_post_ID": "",
+                    "product_sku": p.sku,
+                    "comment_author": r.reviewer,
+                    "comment_author_email": r.email,
+                    "comment_date": r.date,
+                    "comment_content": r.content,
                     "comment_approved": "1",
-                    "rating": str(review.rating),
-                    "title": review.title,
-                    "verified": "1" if review.verified else "0",
+                    "rating": str(r.rating),
+                    "title": r.title,
+                    "verified": _b(r.verified),
                 })
-    log.info("Reviews CSV written to %s", filepath)
+    total = sum(len(p.reviews) for p in products)
+    log.info("Reviews CSV → %s  (%d reviews)", path, total)
 
 
-def write_json(products: list[Product], filepath: str) -> None:
-    """Write full product data as JSON for debugging / downstream use."""
+def write_json(products: list[Product], path: str):
     import dataclasses
-
-    def _serial(obj):
-        if dataclasses.is_dataclass(obj):
-            return dataclasses.asdict(obj)
-        raise TypeError(f"Object {obj!r} not JSON serialisable")
-
-    with open(filepath, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump([dataclasses.asdict(p) for p in products], f, indent=2, ensure_ascii=False)
-    log.info("JSON dump written to %s", filepath)
+    log.info("JSON dump → %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -973,74 +839,54 @@ def write_json(products: list[Product], filepath: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape darkchemsite.com products → WooCommerce CSV"
+        description="Scrape darkchemsite.com → WooCommerce CSV"
     )
-    parser.add_argument("--output", default="products.csv", help="Products CSV output path")
-    parser.add_argument("--reviews", default="reviews.csv", help="Reviews CSV output path")
-    parser.add_argument("--json", default="products.json", help="Full JSON output path")
-    parser.add_argument(
-        "--delay", type=float, default=1.5,
-        help="Seconds to wait between requests (default: 1.5)"
-    )
-    parser.add_argument(
-        "--max-pages", type=int, default=0,
-        help="Maximum listing pages to scrape (0 = all)"
-    )
-    parser.add_argument(
-        "--use-playwright", action="store_true",
-        help="Force Playwright for JS rendering (auto-enabled on 403)"
-    )
-    parser.add_argument(
-        "--product-url", action="append", default=[],
-        dest="product_urls",
-        help="Scrape a specific product URL (can be repeated; skips listing scrape)"
-    )
+    parser.add_argument("--output", default="products.csv")
+    parser.add_argument("--reviews", default="reviews.csv")
+    parser.add_argument("--json-out", default="products.json")
+    parser.add_argument("--delay", type=float, default=1.5)
+    parser.add_argument("--headless", action="store_true",
+                        help="Run browser headless (default: visible window)")
+    parser.add_argument("--product-url", action="append", default=[], dest="product_urls")
     args = parser.parse_args()
 
-    fetcher = Fetcher(delay=args.delay, use_playwright=args.use_playwright)
+    browser = Browser(headless=args.headless, delay=args.delay)
+    browser.start()
     products: list[Product] = []
 
     try:
-        # Determine which product URLs to scrape
         if args.product_urls:
-            product_urls = args.product_urls
-            log.info("Scraping %d user-supplied product URLs", len(product_urls))
+            urls = args.product_urls
         else:
-            product_urls = collect_product_urls(fetcher, max_pages=args.max_pages)
+            urls = collect_product_urls(browser)
 
-        if not product_urls:
-            log.error("No product URLs found. Exiting.")
+        if not urls:
+            log.error("No product URLs found.")
             sys.exit(1)
 
-        for i, url in enumerate(product_urls, 1):
-            log.info("[%d/%d] Scraping product: %s", i, len(product_urls), url)
-            soup = fetcher.get(url)
-            if soup is None:
-                log.warning("Skipping (failed to fetch): %s", url)
-                continue
-            product = parse_product(soup, url)
+        for i, url in enumerate(urls, 1):
+            log.info("[%d/%d] %s", i, len(urls), url)
+            html, nd = browser.get(url, settle_ms=3000)
+            product = parse_product_page(html, nd, url)
             if product:
                 products.append(product)
-                log.info(
-                    "  -> %s | type=%s | variations=%d | reviews=%d",
-                    product.name, product.type,
-                    len(product.variations), len(product.reviews),
-                )
+                log.info("  → %s | price=%s | vars=%d | reviews=%d",
+                         product.name, product.regular_price,
+                         len(product.variations), len(product.reviews))
             else:
-                log.warning("  -> Could not parse product at %s", url)
+                log.warning("  → parse failed for %s", url)
 
     finally:
-        fetcher.close()
+        browser.close()
 
     if not products:
         log.error("No products scraped.")
         sys.exit(1)
 
-    log.info("Scraped %d products total.", len(products))
     write_products_csv(products, args.output)
     write_reviews_csv(products, args.reviews)
-    write_json(products, args.json)
-    log.info("Done.")
+    write_json(products, args.json_out)
+    log.info("Done. %d products scraped.", len(products))
 
 
 if __name__ == "__main__":
