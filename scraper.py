@@ -273,8 +273,18 @@ def _get_images(page) -> list[str]:
 
 
 def _get_standalone_price(page) -> str:
-    """Grab the displayed price when there are no variant buttons."""
-    for sel in ("[class*='price']", "[class*='amount']", "[class*='cost']"):
+    """
+    Read the currently displayed price from the known price element:
+      <div class="text-2xl font-bold text-purple-400">€400.00<span ...>(25g)</span></div>
+    """
+    # Primary: the exact Tailwind class seen in the HTML
+    for sel in (
+        "div.text-2xl.font-bold",
+        ".text-2xl",
+        "[class*='text-2xl']",
+        "[class*='price']",
+        "[class*='amount']",
+    ):
         try:
             el = page.locator(sel).first
             if el.count():
@@ -283,7 +293,7 @@ def _get_standalone_price(page) -> str:
                     return p
         except Exception:
             pass
-    # Fallback: scan body text for a € or $ price
+    # Fallback: first € price in body text
     try:
         m = re.search(r"[€$£](\d+(?:\.\d+)?)", page.inner_text("body"))
         if m:
@@ -295,49 +305,43 @@ def _get_standalone_price(page) -> str:
 
 def _get_variations(page, base_sku: str) -> list[Variation]:
     """
-    Find quantity-option buttons (25g, 50g, 100g …), click each one,
-    read the displayed price after each click.
+    Quantity options live in:
+      <select class="w-full bg-gray-700 ...">
+        <option value="25">25g</option>
+        <option value="50">50g</option>
+        ...
+      </select>
+    Select each option value, wait for the price div to update, capture price.
     """
-    # Locate buttons whose label looks like a quantity  (e.g. "25g", "500mg", "1000g")
-    qty_re = re.compile(r"^\d+\s*(?:g|mg|ml|kg|oz|lb|unit|piece|tab|cap)s?$", re.I)
+    # Find the quantity <select> (identified by its Tailwind bg-gray-700 class)
+    select = page.locator("select.bg-gray-700, select[class*='bg-gray']").first
+    if not select.count():
+        select = page.locator("select").first   # any select as fallback
+    if not select.count():
+        log.debug("No <select> found on this page.")
+        return []
 
-    # Try several selectors that might hold the option buttons
-    option_selectors = [
-        "button",
-        "[role='button']",
-        "[class*='option']",
-        "[class*='quantity'] button",
-        "[class*='variant'] button",
-        "[class*='size'] button",
-        "[class*='weight'] button",
-    ]
+    # Collect all options
+    options = page.evaluate("""(sel) => {
+        var el = document.querySelector(sel);
+        if (!el) return [];
+        return Array.from(el.options).map(function(o) {
+            return {value: o.value, text: o.text.trim()};
+        });
+    }""", "select.bg-gray-700, select[class*='bg-gray'], select")
 
-    btn_locators = []
-    for sel in option_selectors:
-        try:
-            loc = page.locator(sel)
-            count = loc.count()
-            for i in range(count):
-                try:
-                    label = _clean(loc.nth(i).inner_text())
-                    if qty_re.match(label):
-                        btn_locators.append((label, loc.nth(i)))
-                except Exception:
-                    pass
-            if btn_locators:
-                break
-        except Exception:
-            pass
-
-    if not btn_locators:
-        log.debug("No quantity buttons found on this page.")
+    if not options:
         return []
 
     variations = []
-    for label, btn in btn_locators:
+    for opt in options:
+        value = opt["value"]
+        label = opt["text"]       # e.g. "25g"
+        if not label:
+            continue
         try:
-            btn.click()
-            page.wait_for_timeout(700)          # let price update
+            select.select_option(value=value)
+            page.wait_for_timeout(600)           # let price div re-render
             price = _get_standalone_price(page)
             var_sku = f"{base_sku}-{label.replace(' ', '').upper()}"
             variations.append(Variation(
