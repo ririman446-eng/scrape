@@ -172,33 +172,33 @@ def scrape_product(page, url: str) -> Optional[Product]:
         name = slug.replace("-", " ").title()
 
     # ── category ──────────────────────────────────────────────────────────
-    # Most reliable: find a breadcrumb link whose href contains ?category=
-    # e.g. <a href="/products?category=cannabinoids">cannabinoids</a>
+    # The category appears on the line immediately before the product name
+    # in the breadcrumb section of the body text:
+    #   "Products\n/\ncannabinoids\n/\n4fadb precursor/kit"
+    # We walk backwards from the product name skipping "/" and nav items.
     category = ""
     try:
-        cat_links = page.locator("a[href*='category']").all()
-        for lnk in cat_links:
-            href = lnk.get_attribute("href") or ""
-            m = re.search(r"[?&]category=([^&/#\s]+)", href)
-            if m:
-                from urllib.parse import unquote
-                category = _clean(unquote(m.group(1)).replace("+", " "))
-                break
+        body_text = page.inner_text("body")
+        _nav_words = {
+            "home", "shop", "about", "contact us", "login", "products",
+            "search products", "/", "email us", "chat with us on whatsapp",
+            "skip to main content",
+        }
+        lines = [l.strip() for l in body_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            if name and name.lower() in line.lower() and len(line) < len(name) + 10:
+                # Walk back up to 6 lines looking for the category label
+                for j in range(i - 1, max(0, i - 7), -1):
+                    cand = lines[j]
+                    if cand.lower() in _nav_words or cand == "/":
+                        continue
+                    if 2 < len(cand) < 50 and cand[0].isalpha():
+                        category = cand.lower()
+                        break
+                if category:
+                    break
     except Exception:
         pass
-    # Fallback: parse body text breadcrumb pattern
-    # "Products\n/\n{category}\n/\n{product_name}"
-    if not category:
-        try:
-            body_text = page.inner_text("body")
-            m = re.search(
-                r"Products\s*[/\n]\s*([^\n/]{2,40}?)\s*[/\n]\s*" + re.escape(name[:20]),
-                body_text, re.I
-            )
-            if m:
-                category = _clean(m.group(1))
-        except Exception:
-            pass
 
     # ── description ───────────────────────────────────────────────────────
     # Parse from body text: content between "Description" heading
