@@ -147,7 +147,12 @@ class Fetcher:
     # -- requests-based fetch -----------------------------------------------
 
     def get(self, url: str, retries: int = 4) -> Optional[BeautifulSoup]:
+        # If Playwright mode is forced, skip requests entirely
+        if self.use_playwright:
+            return self._playwright_get(url)
+
         wait = 2
+        last_exc = None
         for attempt in range(retries):
             try:
                 log.debug("GET %s (attempt %d)", url, attempt + 1)
@@ -165,11 +170,16 @@ class Fetcher:
                     return self._playwright_get(url)
                 log.error("HTTP %s for %s", resp.status_code, url)
                 return None
+            except requests.exceptions.ProxyError as exc:
+                # Hard proxy block – no point retrying with requests
+                log.warning("Proxy error for %s – switching to Playwright: %s", url, exc)
+                return self._playwright_get(url)
             except requests.RequestException as exc:
+                last_exc = exc
                 log.warning("Request error (%s), retry in %ds", exc, wait)
                 time.sleep(wait)
                 wait *= 2
-        log.error("All retries exhausted for %s", url)
+        log.error("All retries exhausted for %s (last error: %s)", url, last_exc)
         return None
 
     # -- Playwright fallback ------------------------------------------------
