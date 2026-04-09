@@ -256,7 +256,7 @@ def _get_images(page) -> list[str]:
             "img[src]", "els => els.map(e => e.src)"
         )
         for src in srcs:
-            if any(x in src for x in ("/uploads/", "/products/", "cloudinary", "_next/image")):
+            if any(x in src for x in ("/uploads/", "cloudinary", "_next/image")):
                 # For _next/image, decode the actual URL from the query param
                 if "_next/image" in src:
                     m = re.search(r"url=([^&]+)", src)
@@ -265,6 +265,14 @@ def _get_images(page) -> list[str]:
                         src = unquote(m.group(1))
                         if src.startswith("/"):
                             src = BASE_URL + src
+                # Skip the site logo and any non-product images
+                skip = ("/images/logo", "/logo.", "/favicon", "/icon",
+                        "placeholder", "avatar", "banner", "hero")
+                if any(x in src.lower() for x in skip):
+                    continue
+                # Only keep actual product image paths
+                if not any(x in src for x in ("/uploads/products/", "cloudinary.com", "/uploads/")):
+                    continue
                 if src not in imgs:
                     imgs.append(src)
     except Exception:
@@ -459,7 +467,7 @@ def _parent_row(p: Product, pos: int) -> dict:
         "Allow customer reviews?": "1", "Purchase note": "",
         "Sale price": "", "Regular price": p.regular_price,
         "Categories": p.category, "Tags": "", "Shipping class": "",
-        "Images": " | ".join(p.images),
+        "Images": ", ".join(p.images),
         "Download limit": "", "Download expiry": "",
         "Parent": "", "Grouped products": "", "Upsells": "", "Cross-sells": "",
         "External URL": "", "Button text": "", "Position": str(pos),
