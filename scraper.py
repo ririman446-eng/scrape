@@ -172,40 +172,51 @@ def scrape_product(page, url: str) -> Optional[Product]:
         name = slug.replace("-", " ").title()
 
     # ── category ──────────────────────────────────────────────────────────
+    # Most reliable: find a breadcrumb link whose href contains ?category=
+    # e.g. <a href="/products?category=cannabinoids">cannabinoids</a>
     category = ""
     try:
-        # breadcrumb usually: Home / Products / {category} / {name}
-        crumbs = page.locator("nav a, [class*='breadcrumb'] a, [aria-label*='breadcrumb'] a")
-        texts = [_clean(crumbs.nth(i).inner_text()) for i in range(crumbs.count())]
-        skip = {"home", "products", name.lower(), "shop"}
-        cats = [t for t in texts if t and t.lower() not in skip]
-        category = cats[-1] if cats else ""
+        cat_links = page.locator("a[href*='category']").all()
+        for lnk in cat_links:
+            href = lnk.get_attribute("href") or ""
+            m = re.search(r"[?&]category=([^&/#\s]+)", href)
+            if m:
+                from urllib.parse import unquote
+                category = _clean(unquote(m.group(1)).replace("+", " "))
+                break
     except Exception:
         pass
+    # Fallback: parse body text breadcrumb pattern
+    # "Products\n/\n{category}\n/\n{product_name}"
     if not category:
-        # Try a tag/badge near the top
-        for sel in ("[class*='category']", "[class*='tag']", "[class*='badge']"):
-            try:
-                el = page.locator(sel).first
-                if el.count():
-                    category = _clean(el.inner_text())
-                    break
-            except Exception:
-                pass
-
-    # ── description ───────────────────────────────────────────────────────
-    description = ""
-    for sel in ("[class*='description']", "[class*='detail']",
-                "[class*='about']", "article", "section"):
         try:
-            el = page.locator(sel).first
-            if el.count():
-                t = _clean(el.inner_text())
-                if len(t) > 50:
-                    description = t
-                    break
+            body_text = page.inner_text("body")
+            m = re.search(
+                r"Products\s*[/\n]\s*([^\n/]{2,40}?)\s*[/\n]\s*" + re.escape(name[:20]),
+                body_text, re.I
+            )
+            if m:
+                category = _clean(m.group(1))
         except Exception:
             pass
+
+    # ── description ───────────────────────────────────────────────────────
+    # Parse from body text: content between "Description" heading
+    # and "Customer Reviews" section — avoids lorem ipsum placeholders.
+    description = ""
+    try:
+        body_text = page.inner_text("body")
+        m = re.search(
+            r"\bDescription\b\s*\n([\s\S]+?)(?=\n\s*Customer Reviews|\n\s*Reviews\b|\Z)",
+            body_text
+        )
+        if m:
+            desc_text = _clean(m.group(1))
+            # Reject if it's clearly a placeholder
+            if "lorem ipsum" not in desc_text.lower() and len(desc_text) > 30:
+                description = desc_text
+    except Exception:
+        pass
 
     # ── stock ─────────────────────────────────────────────────────────────
     in_stock  = True
@@ -474,7 +485,7 @@ def _parent_row(p: Product, pos: int) -> dict:
         "Attribute 1 name": "Quantity" if p.variations else "",
         "Attribute 1 value(s)": qty_values,
         "Attribute 1 visible": "1" if p.variations else "",
-        "Attribute 1 global": "1" if p.variations else "",
+        "Attribute 1 global": "0" if p.variations else "",
     }
 
 
@@ -498,7 +509,7 @@ def _variation_row(v: Variation, p: Product, pos: int) -> dict:
         "Attribute 1 name": "Quantity",
         "Attribute 1 value(s)": v.label,
         "Attribute 1 visible": "1",
-        "Attribute 1 global": "1",
+        "Attribute 1 global": "0",
     }
 
 
